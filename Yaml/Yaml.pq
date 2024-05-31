@@ -4,6 +4,30 @@ section Yaml;
 
 [DataSource.Kind="Yaml", Publish="Yaml.Publish"]
 shared Yaml.Parse = let
+    // see: https://yaml.org/spec/1.2.2
+
+    Indicators = {
+        "-",  // c-sequence-entry
+        "?",  // c-mapping-key
+        ":",  // c-mapping-value
+        ",",  // c-collect-entry
+        "[",  // c-sequence-start
+        "]",  // c-sequence-end
+        "{",  // c-mapping-start
+        "}",  // c-mapping-end
+        "#",  // c-comment
+        "&",  // c-anchor
+        "*",  // c-alias
+        "!",  // c-tag
+        "|",  // c-literal
+        ">",  // c-folded
+        "'",  // c-single-quote
+        """", // c-double-quote
+        "%",  // c-directive
+        "@",  // c-reserved
+        "`"   // c-reserved
+    },
+
     Spec = {
         // Empty line
         {each Text.TrimStart([Line], " ") = "", each [
@@ -21,9 +45,17 @@ shared Yaml.Parse = let
         {each Text.StartsWith([Line], "---"), each error "Tokenizer not implemented: '---'"},
         {each Text.StartsWith([Line], "..."), each error "Tokenizer not implemented: '...'"},
 
-        // List item
+        // Block sequence entry indicator
+        // https://yaml.org/spec/1.2.2/#rule-c-sequence-entry
         {each Text.StartsWith([Line], "-"), each [
-            Type = "list item",
+            Type = "c-sequence-entry",
+            End = [Cursor] + 1
+        ]},
+
+        // Mapping key indicator
+        // https://yaml.org/spec/1.2.2/#rule-c-mapping-key
+        {each Text.StartsWith([Line], "?"), each [
+            Type = "c-mapping-key",
             End = [Cursor] + 1
         ]},
 
@@ -55,9 +87,10 @@ shared Yaml.Parse = let
                 ]
         },
 
-        // Property indicator
+        // Mapping value indicator
+        // https://yaml.org/spec/1.2.2/#rule-c-mapping-key
         {each Text.StartsWith([Line], ":"), each [
-            Type = "property",
+            Type = "c-mapping-value",
             End = [Cursor] + 1
         ]},
 
@@ -79,18 +112,41 @@ shared Yaml.Parse = let
         // Tag property
         {each Text.StartsWith([Line], "!"), each error "Tokenizer not implemented: '!'"},
 
-        // Flow collection
-        {each Text.StartsWith([Line], "{"), each error "Tokenizer not implemented: '{'"},
-        {each Text.StartsWith([Line], "}"), each error "Tokenizer not implemented: '}'"},
+        // Flow collection entry indicator
+        // https://yaml.org/spec/1.2.2/#rule-c-collect-entry
+        {each Text.StartsWith([Line], ","), each [
+            Type = "c-collect-entry",
+            End = [Cursor] + 1
+        ]},
 
-        // Block collection
-        {each Text.StartsWith([Line], "?"), each error "Tokenizer not implemented: '?'"},
-        {each Text.StartsWith([Line], ":"), each error "Tokenizer not implemented: ':'"},
+        // Flow sequence indicators
+        // https://yaml.org/spec/1.2.2/#rule-c-sequence-start
+        {each Text.StartsWith([Line], "["), each [
+            Type = "c-sequence-start",
+            End = [Cursor] + 1
+        ]},
+        // https://yaml.org/spec/1.2.2/#rule-c-sequence-end
+        {each Text.StartsWith([Line], "]"), each [
+            Type = "c-sequence-end",
+            End = [Cursor] + 1
+        ]},
+
+        // Flow mapping indicators
+        // https://yaml.org/spec/1.2.2/#rule-c-mapping-start
+        {each Text.StartsWith([Line], "{"), each [
+            Type = "c-mapping-start",
+            End = [Cursor] + 1
+        ]},
+        // https://yaml.org/spec/1.2.2/#rule-c-mapping-end
+        {each Text.StartsWith([Line], "}"), each [
+            Type = "c-mapping-end",
+            End = [Cursor] + 1
+        ]},
 
         // Unquoted string
         {each true, each
             let
-                Value = Parse_UnquotedString([Line], {":", "#", "*", "&"}),
+                Value = Parse_UnquotedString([Line], Indicators),
                 End = [Cursor] + Value.Metadata(Value)[End]
             in 
                 [
@@ -100,6 +156,18 @@ shared Yaml.Parse = let
                 ]
         }
     },
+
+    Parser_AssertAndThenGetNextToken = (state, tokenType as text) =>
+        Parser_GetNextToken(
+            Parser_AssertTokenType(state, tokenType)
+        ),
+
+    Parser_AssertTokenType = (state, tokenType as text) =>
+        if state[Token][Type] = tokenType then state
+        else error Text.Format("Syntax error: Expected token type '#[Expected]' instead got '#[Actual]'", [
+            Expected = tokenType,
+            Actual = state[Token][Type]
+        ]),
     
     Parser_GetNextToken = (state) =>
         let
@@ -226,7 +294,7 @@ shared Yaml.Parse = let
         in
             Text meta [End = End],
 
-    Parse_List = (state) as list =>
+    Parse_BlockSequence = (state) as list =>
         let
             // Save indentation level to determine scope
             Indentation = state[Indentation],
@@ -242,28 +310,71 @@ shared Yaml.Parse = let
         in
             // If end of list is reached, return the item in a list
             if State_2[Token] = null then {Item} meta State_2
-            else if State_2[Token][Type] <> "list item" then {Item} meta State_2
+            else if State_2[Token][Type] <> "c-sequence-entry" then {Item} meta State_2
             else if State_2[Indentation] < Indentation then {Item} meta State_2
             
             // If the next token is a list item at the same indentation level, parse rest of the items and combine them into a list
             else 
                 let
-                    Rest = @Parse_List(State_2),
+                    Rest = @Parse_BlockSequence(State_2),
                     List = {Item} & Rest,
                     State_3 = Value.Metadata(Rest)
                 in
                     List meta State_3,
 
-    Parse_Record = (state) as record =>
+    Parse_FlowSequence = (state) as list =>
+        // If next token is sequence end indicator, return empty list
+        if state[Token][Type] = "c-sequence-end"
+            then {} meta Parser_GetNextToken(state)
+
+        else
+            let
+                // Parse sequence entry
+                Item = Parse_Node(state),
+
+                // State of the parser after item was parsed
+                State_1 = Value.Metadata(Item)
+            in
+                // If next token is sequence end indicator, return list with one item
+                if State_1[Token][Type] = "c-sequence-end" then {Item} meta Parser_GetNextToken(State_1)
+                
+                // Otherwise parse rest of the items and combine them into a list
+                else 
+                    let
+                        State_2 = Parser_AssertAndThenGetNextToken(State_1, "c-collect-entry"),
+                        Rest = @Parse_FlowSequence(State_2),
+                        List = {Item} & Rest,
+                        State_3 = Value.Metadata(Rest)
+                    in
+                        List meta State_3,
+
+    Parse_MappingKey = (state) as text =>
+        let
+            State_1 = Parser_GetNextToken(state),
+            State_2 = Parser_GetNextToken(State_1)
+        in
+            if state[Token][Type] = "string"
+                then state[Token][Value] 
+                    meta Parser_AssertAndThenGetNextToken(State_1, "c-mapping-value")
+
+            else if state[Token][Type] <> "c-mapping-key" then error "Syntax error"
+
+            else if State_1[Token][Type] = "string"
+                then State_1[Token][Value]
+                    meta Parser_AssertAndThenGetNextToken(State_2, "c-mapping-value")
+            
+            else error "Non-string mapping keys are not implemented",
+
+    Parse_BlockMapping = (state) as record =>
         let
             // Save indentation level to determine scope
             Indentation = state[Indentation],
 
             // Property key is the value of current string token
-            PropertyKey = state[Token][Value],
+            PropertyKey = Parse_MappingKey(state),
 
-            // Move cursor to next token after property indicator
-            State_1 = Parser_GetNextToken(Parser_GetNextToken(state)),
+            // State of the parser after mapping value indicator
+            State_1 = Value.Metadata(PropertyKey),
 
             // Parse property value node
             PropertyValue = Parse_Node(State_1),
@@ -284,15 +395,49 @@ shared Yaml.Parse = let
                 let
                     State_3 = Parser_GetNextToken(State_2)
                 in
-                    if State_3[Token][Type] <> "property" then PropertyRecord meta State_2
+                    if State_3[Token][Type] <> "c-mapping-value" then PropertyRecord meta State_2
                     else
                         let
-                            Rest = @Parse_Record(State_2),
+                            Rest = @Parse_BlockMapping(State_2),
                             Record = Record.Combine({PropertyRecord} & {Rest}),
                             State_4 = Value.Metadata(Rest)
                         in
                             Record meta State_4,
 
+    Parse_FlowMapping = (state) as record =>
+        // If next token is mapping end indicator, return empty record
+        if state[Token][Type] = "c-mapping-end"
+            then [] meta Parser_GetNextToken(state)
+
+        else
+            let
+                // Property key is the value of current string token
+                PropertyKey = Parse_MappingKey(state),
+
+                // State of the parser after mapping value indicator
+                State_1 = Value.Metadata(PropertyKey),
+
+                // Parse property value node
+                PropertyValue = Parse_Node(State_1),
+
+                // State of the parser after value was parsed
+                State_2 = Value.Metadata(PropertyValue),
+
+                // Property and value as record
+                PropertyRecord = Record.FromList({PropertyValue}, {PropertyKey})
+            in
+                // If next token is mapping end indicator, return record
+                if State_2[Token][Type] = "c-mapping-end" then PropertyRecord meta Parser_GetNextToken(State_2)
+                
+                // Otherwise parse rest of the propeties and combine them into a record
+                else 
+                    let
+                        State_3 = Parser_AssertAndThenGetNextToken(State_2, "c-collect-entry"),
+                        Rest = @Parse_FlowMapping(State_3),
+                        Record = Record.Combine({PropertyRecord} & {Rest}),
+                        State_4 = Value.Metadata(Rest)
+                    in
+                        Record meta State_4,
     
     Parse_Scalar = (state) => error "Not implemented: Parse_Scalar",
 
@@ -310,9 +455,19 @@ shared Yaml.Parse = let
             NextTokenType = NextState[Token][Type]
         in
             if state[Cursor] = state[End] then error "Syntax error: empty node"
-            else if TokenType = "list item" then Parse_List(state)
-            else if TokenType = "string" and NextTokenType = "property" then Parse_Record(state)
+
+            else if TokenType = "c-sequence-start" then Parse_FlowSequence(NextState)
+
+            else if TokenType = "c-sequence-entry" then Parse_BlockSequence(state)
+            
+            else if TokenType = "c-mapping-start" then Parse_FlowMapping(NextState)
+            
+            else if TokenType = "c-mapping-key" then Parse_BlockMapping(state)
+            
+            else if TokenType = "string" and NextTokenType = "c-mapping-value" then Parse_BlockMapping(state)
+            
             else if TokenType = "string" then state[Token][Value] meta NextState
+            
             else error Text.Format("Syntax error: unexpected token '#[TokenType]'", [TokenType = state[Token][Type]]),
 
     Parser_Initialize = (yaml as text) => Parser_GetNextToken([
