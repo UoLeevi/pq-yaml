@@ -6,6 +6,7 @@ section Yaml;
 shared Yaml.Parse = let
     // see: https://yaml.org/spec/1.2.2
 
+    // https://yaml.org/spec/1.2.2/#rule-c-indicator
     Indicators = {
         "-",  // c-sequence-entry
         "?",  // c-mapping-key
@@ -28,6 +29,15 @@ shared Yaml.Parse = let
         "`"   // c-reserved
     },
 
+    // https://yaml.org/spec/1.2.2/#rule-c-flow-indicator
+    FlowIndicators = {
+        ",", // c-collect-entry
+        "[", // c-sequence-start
+        "]", // c-sequence-end
+        "{", // c-mapping-start
+        "}"  // c-mapping-end
+    },
+
     Spec = {
         // Empty line
         {each Text.TrimStart([Line], " ") = "", each [
@@ -36,14 +46,25 @@ shared Yaml.Parse = let
         ]},
 
         // Comment
+        // https://yaml.org/spec/1.2.2/#rule-c-comment
         {each Text.StartsWith([Line], "#"), each [
-            Type = null,
+            Type = null, // c-comment
             End = [Cursor_NextLine]
         ]},
 
-        // Document start and end
-        {each Text.StartsWith([Line], "---"), each error "Tokenizer not implemented: '---'"},
-        {each Text.StartsWith([Line], "..."), each error "Tokenizer not implemented: '...'"},
+        // Directives end marker
+        // https://yaml.org/spec/1.2.2/#rule-c-directives-end
+        {each Text.StartsWith([Line], "---"), each [
+            Type = "c-directives-end",
+            End = [Cursor] + 3
+        ]},
+
+        // Document end marker
+        // https://yaml.org/spec/1.2.2/#rule-c-document-end
+        {each Text.StartsWith([Line], "..."), each [
+            Type = "c-document-end",
+            End = [Cursor] + 3
+        ]},
 
         // Block sequence entry indicator
         // https://yaml.org/spec/1.2.2/#rule-c-sequence-entry
@@ -59,31 +80,66 @@ shared Yaml.Parse = let
             End = [Cursor] + 1
         ]},
 
-        // Double quoted string
-        {each Text.StartsWith([Line], """"), each
+        // Single-quoted flow scalar indicator
+        // https://yaml.org/spec/1.2.2/#rule-c-single-quote
+        {each Text.StartsWith([Line], "'"), each
             let
-                RemainingText = Text.Middle([String], [Cursor]),
-                Value = Parse_DoubleQuotedString(RemainingText),
-                End = [Cursor] + Value.Metadata(Value)[End]
+                PositionOfEndOfString = (input as text) as number =>
+                    let
+                        PositionOf_SingleQuote = Text.PositionOf(input, "'"),
+                        Length = Text.Length(input)
+                    in
+                        if PositionOf_SingleQuote = Length - 1
+                            then PositionOf_SingleQuote + 1
+                            else
+                                let
+                                    TextAfterSingleQuote = Text.Middle(input, PositionOf_SingleQuote + 1),
+                                    CountOfSingleQuotes = 1 + List.Count(List.Generate(
+                                        () => 1,
+                                        each Text.StartsWith(TextAfterSingleQuote, Text.Repeat("'", _)),
+                                        each _ + 1
+                                    ))
+                        in
+                            if Number.IsOdd(CountOfSingleQuotes)
+                                then PositionOf_SingleQuote + CountOfSingleQuotes
+                                else PositionOf_SingleQuote + CountOfSingleQuotes + 1 + @PositionOfEndOfString(Text.Middle(TextAfterSingleQuote, CountOfSingleQuotes)),
+
+                TextAfterInitialSingleQuote = Text.Middle([String], [Cursor] + 1),
+                Length = PositionOfEndOfString(TextAfterInitialSingleQuote) + 1,
+                Text = Text.Replace(Text.Start(TextAfterInitialSingleQuote, Length - 2), "''", "'")
             in 
                 [
-                    Type = "string",
-                    Value = Value,
-                    End = End
+                    Type = "string", // c-single-quote
+                    Value = Text,
+                    End = [Cursor] + Length
                 ]
         },
 
-        // Single quoted string
-        {each Text.StartsWith([Line], "'"), each
+        // Double-quoted flow scalar indicator
+        // https://yaml.org/spec/1.2.2/#rule-c-double-quote
+        {each Text.StartsWith([Line], """"), each
             let
+                PositionOfEndOfString = (input as text) as number =>
+                    let
+                        PositionOf_DoubleQuote = Text.PositionOf(Text.Middle(input, 1), """"),
+                        IsEscaped = Number.IsOdd(List.Count(List.Generate(
+                            () => 0,
+                            each _ < PositionOf_DoubleQuote and Text.At(input, PositionOf_DoubleQuote - _) = "\",
+                            each _ + 1
+                        )))
+                    in
+                        if IsEscaped
+                            then PositionOf_DoubleQuote + 2 + @PositionOfEndOfString(Text.Middle(input, PositionOf_DoubleQuote + 2))
+                            else PositionOf_DoubleQuote + 2,
+
                 RemainingText = Text.Middle([String], [Cursor]),
-                Value = Parse_SingleQuotedString(RemainingText),
-                End = [Cursor] + Value.Metadata(Value)[End]
+                Length = PositionOfEndOfString(RemainingText),
+                Text = Text.Replace(Text.Replace(Text.Middle(RemainingText, 1, Length - 2), "\\", "\"), "\""", """")
             in 
                 [
-                    Type = "string",
-                    Value = Value,
-                    End = End
+                    Type = "string", // c-double-quote
+                    Value = Text,
+                    End = [Cursor] + Length
                 ]
         },
 
@@ -94,23 +150,85 @@ shared Yaml.Parse = let
             End = [Cursor] + 1
         ]},
 
-        // Multiline literal
-        {each Text.StartsWith([Line], "|"), each error "Tokenizer not implemented: '|'"},
+        // Literal block scalar indicator
+        // https://yaml.org/spec/1.2.2/#rule-c-literal
+        {each Text.StartsWith([Line], "|"), each [
+            Type = "c-literal",
+            End = [Cursor] + 1
+        ]},
 
-        // Multiline folded
-        {each Text.StartsWith([Line], ">"), each error "Tokenizer not implemented: '>'"},
+        // Folded block scalar indicator
+        // https://yaml.org/spec/1.2.2/#rule-c-folded
+        {each Text.StartsWith([Line], ">"), each [
+            Type = "c-folded",
+            End = [Cursor] + 1
+        ]},
 
-        // Directive
-        {each Text.StartsWith([Line], "%"), each error "Tokenizer not implemented: '%'"},
+        // Directive indicator
+        // https://yaml.org/spec/1.2.2/#rule-c-directive
+        {each Text.StartsWith([Line], "%"), each [
+            Type = "c-directive",
+            End = [Cursor] + 1
+        ]},
 
         // Alias node
-        {each Text.StartsWith([Line], "*"), each error "Tokenizer not implemented: '*'"},
+        // https://yaml.org/spec/1.2.2/#rule-c-ns-alias-node
+        {each Text.StartsWith([Line], "*"), each
+            let
+                LineAfterIndicator = Text.Middle([Line], 1),
+                Delimiters = FlowIndicators & {" ", "#(tab)"},
+                DelimiterPositions = {Text.Length(LineAfterIndicator)} & List.Select(
+                    List.Transform(
+                        Delimiters,
+                        each Text.PositionOf(LineAfterIndicator, _)
+                    ),
+                    each _ > -1
+                ),
+                Text = Text.TrimEnd(Text.Start(LineAfterIndicator, List.Min(DelimiterPositions))),
+                End = [Cursor] + Text.Length(Text) + 1
+            in 
+                [
+                    Type = "c-ns-alias-node",
+                    Value = Text,
+                    End = End
+                ]
+        },
 
-        // Anchor node
-        {each Text.StartsWith([Line], "&"), each error "Tokenizer not implemented: '&'"},
+        // Anchor property
+        // https://yaml.org/spec/1.2.2/#rule-c-ns-anchor-property
+        {each Text.StartsWith([Line], "&"), each
+            let
+                LineAfterIndicator = Text.Middle([Line], 1),
+                Delimiters = FlowIndicators & {" ", "#(tab)"},
+                DelimiterPositions = {Text.Length(LineAfterIndicator)} & List.Select(
+                    List.Transform(
+                        Delimiters,
+                        each Text.PositionOf(LineAfterIndicator, _)
+                    ),
+                    each _ > -1
+                ),
+                Text = Text.TrimEnd(Text.Start(LineAfterIndicator, List.Min(DelimiterPositions))),
+                End = [Cursor] + Text.Length(Text) + 1
+            in 
+                [
+                    Type = "c-ns-anchor-property",
+                    Value = Text,
+                    End = End
+                ]
+        },
 
-        // Tag property
-        {each Text.StartsWith([Line], "!"), each error "Tokenizer not implemented: '!'"},
+        // Tag indicators
+        // https://yaml.org/spec/1.2.2/#rule-c-tag
+        // https://yaml.org/spec/1.2.2/#rule-c-secondary-tag-handle
+        {each Text.StartsWith([Line], "!!"), each [
+            Type = "c-secondary-tag-handle",
+            End = [Cursor] + 2
+        ]},
+        // https://yaml.org/spec/1.2.2/#rule-c-primary-tag-handle
+        {each Text.StartsWith([Line], "!"), each [
+            Type = "c-primary-tag-handle",
+            End = [Cursor] + 1
+        ]},
 
         // Flow collection entry indicator
         // https://yaml.org/spec/1.2.2/#rule-c-collect-entry
@@ -143,33 +261,41 @@ shared Yaml.Parse = let
             End = [Cursor] + 1
         ]},
 
-        // Unquoted string
+        // Plain (unquoted) scalar
+        // https://yaml.org/spec/1.2.2/#rule-ns-plain-first
         {each true, each
             let
-                Value = Parse_UnquotedString([Line], Indicators),
-                End = [Cursor] + Value.Metadata(Value)[End]
+                Line = [Line],
+                DelimiterPositions = {Text.Length(Line)} & List.Select(
+                    List.Transform(
+                        Indicators,
+                        each Text.PositionOf(Line, _)
+                    ),
+                    each _ > -1
+                ),
+                Text = Text.TrimEnd(Text.Start(Line, List.Min(DelimiterPositions)))
             in 
                 [
-                    Type = "string",
-                    Value = Value,
-                    End = End
+                    Type = "string", // ns-plain-first
+                    Value = Text,
+                    End = [Cursor] + Text.Length(Text)
                 ]
         }
     },
 
-    Parser_AssertAndThenGetNextToken = (state, tokenType as text) =>
+    Parser_AssertAndThenGetNextToken = (state as record, tokenType as text) as record =>
         Parser_GetNextToken(
             Parser_AssertTokenType(state, tokenType)
         ),
 
-    Parser_AssertTokenType = (state, tokenType as text) =>
+    Parser_AssertTokenType = (state as record, tokenType as text) as record =>
         if state[Token][Type] = tokenType then state
         else error Text.Format("Syntax error: Expected token type '#[Expected]' instead got '#[Actual]'", [
             Expected = tokenType,
             Actual = state[Token][Type]
         ]),
     
-    Parser_GetNextToken = (state) =>
+    Parser_GetNextToken = (state as record) as record =>
         let
             // Update cursor to point to the end of previous token
             State_0 = Record.TransformFields(state, {
@@ -230,71 +356,14 @@ shared Yaml.Parse = let
                         then @Parser_GetNextToken(State_2)
                         else State_2,
 
-    Parse_SingleQuotedString = (input as text) as text => 
-        let
-            PositionOfEndOfString = (input as text) as number =>
-                let
-                    PositionOf_SingleQuote = Text.PositionOf(input, "'"),
-                    Length = Text.Length(input)
-                in
-                    if PositionOf_SingleQuote = Length - 1
-                        then PositionOf_SingleQuote + 1
-                        else
-                            let
-                                TextAfterSingleQuote = Text.Middle(input, PositionOf_SingleQuote + 1),
-                                CountOfSingleQuotes = 1 + List.Count(List.Generate(
-                                    () => 1,
-                                    each Text.StartsWith(TextAfterSingleQuote, Text.Repeat("'", _)),
-                                    each _ + 1
-                                ))
-                    in
-                        if Number.IsOdd(CountOfSingleQuotes)
-                            then PositionOf_SingleQuote + CountOfSingleQuotes
-                            else PositionOf_SingleQuote + CountOfSingleQuotes + 1 + @PositionOfEndOfString(Text.Middle(TextAfterSingleQuote, CountOfSingleQuotes)),
 
-            TextAfterInitialSingleQuote = Text.Middle(input, 1),
-            End = PositionOfEndOfString(TextAfterInitialSingleQuote) + 1,
-            Text = Text.Replace(Text.Start(TextAfterInitialSingleQuote, End - 2), "''", "'")
-        in
-            Text meta [End = End],
+    // Node parsing functions
+    // - All node parsing funtions have following signature:
+    //   (state as ParserState) as [State as ParserState, Node as Node]
 
 
-    Parse_DoubleQuotedString = (input as text) as text => 
-        let
-            PositionOfEndOfString = (input as text) as number =>
-            let
-                PositionOf_DoubleQuote = Text.PositionOf(Text.Middle(input, 1), """"),
-                IsEscaped = Number.IsOdd(List.Count(List.Generate(
-                    () => 0,
-                    each _ < PositionOf_DoubleQuote and Text.At(input, PositionOf_DoubleQuote - _) = "\",
-                    each _ + 1
-                )))
-            in
-                if IsEscaped
-                    then PositionOf_DoubleQuote + 2 + @PositionOfEndOfString(Text.Middle(input, PositionOf_DoubleQuote + 2))
-                    else PositionOf_DoubleQuote + 2,
-
-            End = PositionOfEndOfString(input),
-            Text = Text.Replace(Text.Replace(Text.Middle(input, 1, End - 2), "\\", "\"), "\""", """")
-        in
-            Text meta [End = End],
-
-
-    Parse_UnquotedString = (input as text, optional delimiters as list) as text =>
-        let
-            DelimiterPositions = {Text.Length(input)} & List.Select(
-                List.Transform(
-                    delimiters ?? {},
-                    each Text.PositionOf(input, _)
-                ),
-                each _ > -1
-            ),
-            Text = Text.TrimEnd(Text.Start(input, List.Min(DelimiterPositions))),
-            End = Text.Length(Text)
-        in
-            Text meta [End = End],
-
-    Parse_BlockSequence = (state) as list =>
+    // https://yaml.org/spec/1.2.2/#block-sequences
+    Parse_BlockSequence = (state as record) as record =>
         let
             // Save indentation level to determine scope
             Indentation = state[Indentation],
@@ -303,145 +372,215 @@ shared Yaml.Parse = let
             State_1 = Parser_GetNextToken(state),
 
             // Parse list item node
-            Item = Parse_Node(State_1),
-
-            // State of the parser after item was parsed
-            State_2 = Value.Metadata(Item)
+            R_1 = Parse_Node(State_1),
+            Item = R_1[Node],
+            State_2 = R_1[State]
         in
             // If end of list is reached, return the item in a list
-            if State_2[Token] = null then {Item} meta State_2
-            else if State_2[Token][Type] <> "c-sequence-entry" then {Item} meta State_2
-            else if State_2[Indentation] < Indentation then {Item} meta State_2
+            if   State_2[Token] = null 
+              or State_2[Token][Type] <> "c-sequence-entry"
+              or State_2[Indentation] < Indentation 
+                then [State = State_2, Node = {Item}]
             
             // If the next token is a list item at the same indentation level, parse rest of the items and combine them into a list
             else 
                 let
-                    Rest = @Parse_BlockSequence(State_2),
-                    List = {Item} & Rest,
-                    State_3 = Value.Metadata(Rest)
+                    R_2 = @Parse_BlockSequence(State_2),
+                    Rest = R_2[Node],
+                    State_3 = R_2[State]
                 in
-                    List meta State_3,
+                    [State = State_3, Node = {Item} & Rest],
 
-    Parse_FlowSequence = (state) as list =>
+
+    // https://yaml.org/spec/1.2.2/#flow-sequences
+    Parse_FlowSequence = (state as record) as record =>
         // If next token is sequence end indicator, return empty list
         if state[Token][Type] = "c-sequence-end"
-            then {} meta Parser_GetNextToken(state)
+            then [State = Parser_GetNextToken(state), Node = {}]
 
         else
             let
                 // Parse sequence entry
-                Item = Parse_Node(state),
-
-                // State of the parser after item was parsed
-                State_1 = Value.Metadata(Item)
+                R_1 = Parse_Node(state),
+                Item = R_1[Node],
+                State_1 = R_1[State]
             in
                 // If next token is sequence end indicator, return list with one item
-                if State_1[Token][Type] = "c-sequence-end" then {Item} meta Parser_GetNextToken(State_1)
+                if State_1[Token][Type] = "c-sequence-end"
+                    then [State = Parser_GetNextToken(State_1), Node = {Item}]
                 
                 // Otherwise parse rest of the items and combine them into a list
                 else 
                     let
                         State_2 = Parser_AssertAndThenGetNextToken(State_1, "c-collect-entry"),
-                        Rest = @Parse_FlowSequence(State_2),
-                        List = {Item} & Rest,
-                        State_3 = Value.Metadata(Rest)
+                        R_2 = @Parse_FlowSequence(State_2),
+                        Rest = R_2[Node],
+                        State_3 = R_2[State]
                     in
-                        List meta State_3,
+                        [State = State_3, Node = {Item} & Rest],
 
-    Parse_MappingKey = (state) as text =>
+
+    Parse_MappingKey = (state as record) as record =>
         let
             State_1 = Parser_GetNextToken(state),
             State_2 = Parser_GetNextToken(State_1)
         in
             if state[Token][Type] = "string"
-                then state[Token][Value] 
-                    meta Parser_AssertAndThenGetNextToken(State_1, "c-mapping-value")
+                then [
+                    State = Parser_AssertAndThenGetNextToken(State_1, "c-mapping-value"),
+                    Node = state[Token][Value]
+                ] 
 
             else if state[Token][Type] <> "c-mapping-key" then error "Syntax error"
 
             else if State_1[Token][Type] = "string"
-                then State_1[Token][Value]
-                    meta Parser_AssertAndThenGetNextToken(State_2, "c-mapping-value")
+                then [
+                    State = Parser_AssertAndThenGetNextToken(State_2, "c-mapping-value"),
+                    Node = State_1[Token][Value]
+                ]
             
             else error "Non-string mapping keys are not implemented",
 
-    Parse_BlockMapping = (state) as record =>
+
+    // https://yaml.org/spec/1.2.2/#block-mappings
+    Parse_BlockMapping = (state as record) as record =>
         let
             // Save indentation level to determine scope
             Indentation = state[Indentation],
 
-            // Property key is the value of current string token
-            PropertyKey = Parse_MappingKey(state),
+            // Parse mapping key
+            R_1 = Parse_MappingKey(state),
+            MappingKey = R_1[Node],
+            State_1 = R_1[State],
 
-            // State of the parser after mapping value indicator
-            State_1 = Value.Metadata(PropertyKey),
+            // Parse mapping value node
+            R_2 = Parse_Node(State_1),
+            MappingValue = R_2[Node],
+            State_2 = R_2[State],
 
-            // Parse property value node
-            PropertyValue = Parse_Node(State_1),
-
-            // State of the parser after value was parsed
-            State_2 = Value.Metadata(PropertyValue),
-
-            // Property and value as record
-            PropertyRecord = Record.FromList({PropertyValue}, {PropertyKey})
+            // Mapping as record
+            Mapping = Record.FromList({MappingValue}, {MappingKey})
         in
-            // If end of record is reached, return the property and value as record
-            if State_2[Token] = null then PropertyRecord meta State_2
-            else if State_2[Token][Type] <> "string" then PropertyRecord meta State_2
-            else if State_2[Indentation] < Indentation then PropertyRecord meta State_2
+            // If end of record is reached, return the key and value as record
+            if   State_2[Token] = null
+              or State_2[Token][Type] <> "string"
+              or State_2[Indentation] < Indentation
+                then [State = State_2, Node = Mapping]
             
-            // If the next token is a string at the same indentation level and following token is property indicator, parse rest of the propeties and combine them into a record
+            // If the next token is a string at the same indentation level and following token is mapping value indicator, parse rest of the propeties and combine them into a record
             else 
                 let
                     State_3 = Parser_GetNextToken(State_2)
                 in
-                    if State_3[Token][Type] <> "c-mapping-value" then PropertyRecord meta State_2
+                    if State_3[Token][Type] <> "c-mapping-value" then [State = State_2, Node = Mapping]
                     else
                         let
-                            Rest = @Parse_BlockMapping(State_2),
-                            Record = Record.Combine({PropertyRecord} & {Rest}),
-                            State_4 = Value.Metadata(Rest)
+                            R_3 = @Parse_BlockMapping(State_2),
+                            Rest = R_3[Node],
+                            State_4 = R_3[State]
                         in
-                            Record meta State_4,
+                            [State = State_4, Node = Record.Combine({Mapping} & {Rest})],
 
-    Parse_FlowMapping = (state) as record =>
+
+    // https://yaml.org/spec/1.2.2/#flow-mappings
+    Parse_FlowMapping = (state as record) as record =>
         // If next token is mapping end indicator, return empty record
         if state[Token][Type] = "c-mapping-end"
-            then [] meta Parser_GetNextToken(state)
+            then [
+                State = Parser_GetNextToken(state),
+                Node = []
+            ]
 
         else
             let
-                // Property key is the value of current string token
-                PropertyKey = Parse_MappingKey(state),
+                // Parse mapping key
+                R_1 = Parse_MappingKey(state),
+                MappingKey = R_1[Node],
+                State_1 = R_1[State],
 
-                // State of the parser after mapping value indicator
-                State_1 = Value.Metadata(PropertyKey),
+                // Parse mapping value node
+                R_2 = Parse_Node(State_1),
+                MappingValue = R_2[Node],
+                State_2 = R_2[State],
 
-                // Parse property value node
-                PropertyValue = Parse_Node(State_1),
-
-                // State of the parser after value was parsed
-                State_2 = Value.Metadata(PropertyValue),
-
-                // Property and value as record
-                PropertyRecord = Record.FromList({PropertyValue}, {PropertyKey})
+                // Mapping as record
+                Mapping = Record.FromList({MappingValue}, {MappingKey})
             in
                 // If next token is mapping end indicator, return record
-                if State_2[Token][Type] = "c-mapping-end" then PropertyRecord meta Parser_GetNextToken(State_2)
+                if State_2[Token][Type] = "c-mapping-end" then [State = Parser_GetNextToken(State_2), Node = Mapping]
                 
                 // Otherwise parse rest of the propeties and combine them into a record
                 else 
                     let
                         State_3 = Parser_AssertAndThenGetNextToken(State_2, "c-collect-entry"),
-                        Rest = @Parse_FlowMapping(State_3),
-                        Record = Record.Combine({PropertyRecord} & {Rest}),
-                        State_4 = Value.Metadata(Rest)
+                        R_3 = @Parse_FlowMapping(State_3),
+                        Rest = R_3[Node],
+                        State_4 = R_3[State]
                     in
-                        Record meta State_4,
-    
-    Parse_Scalar = (state) => error "Not implemented: Parse_Scalar",
+                        [State = State_4, Node = Record.Combine({Mapping} & {Rest})],
 
-    Parse_Node = (state) => 
+            
+    Parse_LiteralBlockScalar = (state as record) as record => error "Not implemented: Parse_LiteralBlockScalar",
+            
+    Parse_FoldedBlockScalar = (state as record) as record => error "Not implemented: Parse_FoldedBlockScalar",
+
+    Parse_NodeAlias = (state as record) as record =>
+        let
+            Alias = state[Token][Value],
+            Node = Record.Field(state[Aliases], Alias),
+            Metadata = Record.AddField(Value.Metadata(Node), "Alias", Alias)
+        in
+            [
+                State = Parser_GetNextToken(state),
+                Node = Node meta Metadata
+            ],
+
+    Parse_NodeTag = (state as record) as record =>
+        let
+            Prefix =
+                if state[Token][Type] = "c-primary-tag-handle" then "!"
+                else if state[Token][Type] = "c-secondary-tag-handle" then "!!"
+                else error "Unknown tag handle",
+
+            State_1 = Parser_AssertAndThenGetNextToken(Parser_GetNextToken(state), "string"),
+            Tag = Prefix & State_1[Token][Value],
+            
+            R_1 = Parse_Node(State_1),
+            Node = R_1[Node],
+            State_2 = R_1[State],
+            
+            Metadata = Record.AddField(Value.Metadata(Node), "Tag", Tag)
+        in
+            if Record.HasFields(Value.Metadata(Node), "Tag")
+                then error "Syntax error: node can have only a single tag"
+                else [
+                    State = State_2,
+                    Node = Node meta Metadata
+                ],
+
+    Parse_NodeAnchor = (state as record) as record =>
+        let
+            Anchor = state[Token][Value],
+            State_1 = Parser_GetNextToken(state),
+
+            R_1 = Parse_Node(State_1),
+            Node = R_1[Node],
+            State_2 = R_1[State],
+            
+            State_3 = Record.TransformFields(State_2, {
+                {"Aliases", each Record.AddField(_, Anchor, Node)}
+            }),
+
+            Metadata = Record.AddField(Value.Metadata(Node), "Anchor", Anchor)
+        in
+            if Record.HasFields(Value.Metadata(Node), "Anchor")
+                then error "Syntax error: node can have only a single anchor"
+                else [
+                    State = State_3,
+                    Node = Node meta Metadata
+                ],
+
+    Parse_Node = (state as record) as record => 
         /*
           Node
           : Sequence
@@ -456,6 +595,14 @@ shared Yaml.Parse = let
         in
             if state[Cursor] = state[End] then error "Syntax error: empty node"
 
+            else if TokenType = "c-ns-alias-node" then Parse_NodeAlias(state)
+
+            else if TokenType = "c-primary-tag-handle" then Parse_NodeTag(state)
+
+            else if TokenType = "c-secondary-tag-handle" then Parse_NodeTag(state)
+
+            else if TokenType = "c-ns-anchor-property" then Parse_NodeAnchor(state)
+
             else if TokenType = "c-sequence-start" then Parse_FlowSequence(NextState)
 
             else if TokenType = "c-sequence-entry" then Parse_BlockSequence(state)
@@ -463,10 +610,14 @@ shared Yaml.Parse = let
             else if TokenType = "c-mapping-start" then Parse_FlowMapping(NextState)
             
             else if TokenType = "c-mapping-key" then Parse_BlockMapping(state)
-            
+
             else if TokenType = "string" and NextTokenType = "c-mapping-value" then Parse_BlockMapping(state)
             
-            else if TokenType = "string" then state[Token][Value] meta NextState
+            else if TokenType = "string" then [State = NextState, Node = state[Token][Value]]
+            
+            else if TokenType = "c-literal" then Parse_LiteralBlockScalar(state)
+            
+            else if TokenType = "c-folded" then Parse_FoldedBlockScalar(state)
             
             else error Text.Format("Syntax error: unexpected token '#[TokenType]'", [TokenType = state[Token][Type]]),
 
@@ -481,14 +632,17 @@ shared Yaml.Parse = let
         Token = [
             Type = null,
             End = 0
-        ]
+        ],
+        Aliases = []
     ]),
 
     Parse = (optional yaml as text) =>
         let
             State_Initial = Parser_Initialize(yaml)
         in
-            Parse_Node(State_Initial)
+            if State_Initial[Cursor] = State_Initial[End] 
+                then null meta [Message = "Empty YAML document"]
+                else Parse_Node(State_Initial)[Node]
 in
     Parse meta [
         GetTokens = (yaml as text) => List.Generate(
