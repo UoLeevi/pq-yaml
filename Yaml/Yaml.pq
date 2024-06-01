@@ -6,6 +6,52 @@ section Yaml;
 shared Yaml.Parse = let
     // see: https://yaml.org/spec/1.2.2
 
+    Helper_ReadLine = (input as text) as record =>
+        let
+            // Extract text until end of line
+            PositionOf_CrLf = Text.PositionOf(input, "#(cr)#(lf)"),
+            PositionOf_Lf = Text.PositionOf(input, "#(lf)"),
+            LineInfo = 
+                if PositionOf_CrLf = -1 and PositionOf_Lf = -1 then [Line = input, End = Text.Length(input)]
+                else if PositionOf_CrLf = -1 then [Line = Text.Start(input, PositionOf_Lf), End = PositionOf_Lf + 1]
+                else if PositionOf_Lf = -1 then [Line = Text.Start(input, PositionOf_CrLf), End = PositionOf_CrLf + 2]
+                else if PositionOf_CrLf < PositionOf_Lf then [Line = Text.Start(input, PositionOf_CrLf), End = PositionOf_CrLf + 2]
+                else [Line = Text.Start(input, PositionOf_Lf), End = PositionOf_Lf + 1]
+        in
+            LineInfo,
+
+
+    Helper_ReadIndentedLines = (input as text, minimumIndentation as number) as list =>
+        List.Generate(
+            () => [
+                LineIndex = 0,
+                RemainingText = input,
+                LineIndentationPrefix = Text.Repeat(" ", minimumIndentation),
+                NextLineInfo = Helper_ReadLine(input)
+            ],
+            each Text.StartsWith([NextLineInfo][Line], [LineIndentationPrefix]),
+            each
+                let
+                    RemainingText = Text.Middle([RemainingText], [NextLineInfo][End]),
+                    LineIndentationPrefix = if [LineIndex] <> 0
+                        then [LineIndentationPrefix]
+                        else Text.Repeat(" ", Text.Length([NextLineInfo][Line]) - Text.Length(Text.TrimStart([NextLineInfo][Line], " ")))
+                in
+                    [
+                        LineIndex = [LineIndex] + 1,
+                        RemainingText = RemainingText,
+                        LineIndentationPrefix = LineIndentationPrefix,
+                        NextLineInfo = Helper_ReadLine(RemainingText)
+                    ],
+            each [
+                Line = if [LineIndex] = 0
+                    then Text.TrimStart([NextLineInfo][Line], " ")
+                    else Text.Middle([NextLineInfo][Line], Text.Length([LineIndentationPrefix])),
+                End = [NextLineInfo][End]
+            ]
+        ),
+
+
     // https://yaml.org/spec/1.2.2/#rule-c-indicator
     Indicators = {
         "-",  // c-sequence-entry
@@ -152,17 +198,51 @@ shared Yaml.Parse = let
 
         // Literal block scalar indicator
         // https://yaml.org/spec/1.2.2/#rule-c-literal
-        {each Text.StartsWith([Line], "|"), each [
-            Type = "c-literal",
-            End = [Cursor] + 1
-        ]},
+        {each Text.StartsWith([Line], "|"), each
+            let
+                TextAfterIndicator = Text.Middle([String], [Cursor] + 1),
+                HeaderLineInfo = Helper_ReadLine(TextAfterIndicator),
+                TextAfterHeader = Text.Middle([String], [Cursor] + 1 + HeaderLineInfo[End]),
+                BodyLineInfos = Helper_ReadIndentedLines(TextAfterHeader, [Indentation] + 1),
+
+                FinalLineSuffix =
+                    if HeaderLineInfo[Line] = "" then "#(lf)"
+                    else if HeaderLineInfo[Line] = "+" then "#(lf)"
+                    else if HeaderLineInfo[Line] = "-" then ""
+                    else error "Syntax error: Invalid block scalar header",
+
+                Text = Text.Combine(List.Transform(BodyLineInfos, each [Line]), "#(lf)") & FinalLineSuffix
+            in
+                [
+                    Type = "string", // c-literal,
+                    Value = Text,
+                    End = [Cursor] + 1 + HeaderLineInfo[End] + List.Sum(List.Transform(BodyLineInfos, each [End]))
+                ]
+        },
 
         // Folded block scalar indicator
         // https://yaml.org/spec/1.2.2/#rule-c-folded
-        {each Text.StartsWith([Line], ">"), each [
-            Type = "c-folded",
-            End = [Cursor] + 1
-        ]},
+        {each Text.StartsWith([Line], ">"), each
+            let
+                TextAfterIndicator = Text.Middle([String], [Cursor] + 1),
+                HeaderLineInfo = Helper_ReadLine(TextAfterIndicator),
+                TextAfterHeader = Text.Middle([String], [Cursor] + 1 + HeaderLineInfo[End]),
+                BodyLineInfos = Helper_ReadIndentedLines(TextAfterHeader, [Indentation] + 1),
+
+                FinalLineSuffix =
+                    if HeaderLineInfo[Line] = "" then "#(lf)"
+                    else if HeaderLineInfo[Line] = "+" then "#(lf)"
+                    else if HeaderLineInfo[Line] = "-" then ""
+                    else error "Syntax error: Invalid block scalar header",
+
+                Text = Text.Combine(List.Transform(BodyLineInfos, each [Line]), " ") & FinalLineSuffix
+            in
+                [
+                    Type = "string", // c-folded,
+                    Value = Text,
+                    End = [Cursor] + 1 + HeaderLineInfo[End] + List.Sum(List.Transform(BodyLineInfos, each [End]))
+                ]
+        },
 
         // Directive indicator
         // https://yaml.org/spec/1.2.2/#rule-c-directive
@@ -184,13 +264,12 @@ shared Yaml.Parse = let
                     ),
                     each _ > -1
                 ),
-                Text = Text.TrimEnd(Text.Start(LineAfterIndicator, List.Min(DelimiterPositions))),
-                End = [Cursor] + Text.Length(Text) + 1
+                Text = Text.TrimEnd(Text.Start(LineAfterIndicator, List.Min(DelimiterPositions)))
             in 
                 [
                     Type = "c-ns-alias-node",
                     Value = Text,
-                    End = End
+                    End = [Cursor] + Text.Length(Text) + 1
                 ]
         },
 
@@ -207,28 +286,37 @@ shared Yaml.Parse = let
                     ),
                     each _ > -1
                 ),
-                Text = Text.TrimEnd(Text.Start(LineAfterIndicator, List.Min(DelimiterPositions))),
-                End = [Cursor] + Text.Length(Text) + 1
+                Text = Text.TrimEnd(Text.Start(LineAfterIndicator, List.Min(DelimiterPositions)))
             in 
                 [
                     Type = "c-ns-anchor-property",
                     Value = Text,
-                    End = End
+                    End = [Cursor] + Text.Length(Text) + 1
                 ]
         },
 
-        // Tag indicators
+        // Tag
         // https://yaml.org/spec/1.2.2/#rule-c-tag
-        // https://yaml.org/spec/1.2.2/#rule-c-secondary-tag-handle
-        {each Text.StartsWith([Line], "!!"), each [
-            Type = "c-secondary-tag-handle",
-            End = [Cursor] + 2
-        ]},
-        // https://yaml.org/spec/1.2.2/#rule-c-primary-tag-handle
-        {each Text.StartsWith([Line], "!"), each [
-            Type = "c-primary-tag-handle",
-            End = [Cursor] + 1
-        ]},
+        {each Text.StartsWith([Line], "!"), each
+            let
+                // TODO: Implement more strict parsing
+                Line = [Line],
+                Delimiters = {" ", "#(tab)"},
+                DelimiterPositions = {Text.Length(Line)} & List.Select(
+                    List.Transform(
+                        Delimiters,
+                        each Text.PositionOf(Line, _)
+                    ),
+                    each _ > -1
+                ),
+                Text = Text.TrimEnd(Text.Start(Line, List.Min(DelimiterPositions)))
+            in 
+                [
+                    Type = "c-tag",
+                    Value = Text,
+                    End = [Cursor] + Text.Length(Text)
+                ]
+        },
 
         // Flow collection entry indicator
         // https://yaml.org/spec/1.2.2/#rule-c-collect-entry
@@ -315,14 +403,7 @@ shared Yaml.Parse = let
                     String = Text.Middle(State_0[String], State_0[Cursor]),
 
                     // Extract text until end of line
-                    PositionOf_CrLf = Text.PositionOf(String, "#(cr)#(lf)"),
-                    PositionOf_Lf = Text.PositionOf(String, "#(lf)"),
-                    LineInfo = 
-                        if PositionOf_CrLf = -1 and PositionOf_Lf = -1 then [Line = String, End = Text.Length(String)]
-                        else if PositionOf_CrLf = -1 then [Line = Text.Start(String, PositionOf_Lf), End = PositionOf_Lf + 1]
-                        else if PositionOf_Lf = -1 then [Line = Text.Start(String, PositionOf_CrLf), End = PositionOf_CrLf + 2]
-                        else if PositionOf_CrLf < PositionOf_Lf then [Line = Text.Start(String, PositionOf_CrLf), End = PositionOf_CrLf + 2]
-                        else [Line = Text.Start(String, PositionOf_Lf), End = PositionOf_Lf + 1],
+                    LineInfo = Helper_ReadLine(String),
 
                     // Remove leading spaces
                     Line_IndentationRemoved = Text.TrimStart(LineInfo[Line], " "),
@@ -519,11 +600,6 @@ shared Yaml.Parse = let
                     in
                         [State = State_4, Node = Record.Combine({Mapping} & {Rest})],
 
-            
-    Parse_LiteralBlockScalar = (state as record) as record => error "Not implemented: Parse_LiteralBlockScalar",
-            
-    Parse_FoldedBlockScalar = (state as record) as record => error "Not implemented: Parse_FoldedBlockScalar",
-
     Parse_NodeAlias = (state as record) as record =>
         let
             Alias = state[Token][Value],
@@ -537,13 +613,8 @@ shared Yaml.Parse = let
 
     Parse_NodeTag = (state as record) as record =>
         let
-            Prefix =
-                if state[Token][Type] = "c-primary-tag-handle" then "!"
-                else if state[Token][Type] = "c-secondary-tag-handle" then "!!"
-                else error "Unknown tag handle",
-
-            State_1 = Parser_AssertAndThenGetNextToken(Parser_GetNextToken(state), "string"),
-            Tag = Prefix & State_1[Token][Value],
+            Tag = state[Token][Value],
+            State_1 = Parser_GetNextToken(state),
             
             R_1 = Parse_Node(State_1),
             Node = R_1[Node],
@@ -597,9 +668,7 @@ shared Yaml.Parse = let
 
             else if TokenType = "c-ns-alias-node" then Parse_NodeAlias(state)
 
-            else if TokenType = "c-primary-tag-handle" then Parse_NodeTag(state)
-
-            else if TokenType = "c-secondary-tag-handle" then Parse_NodeTag(state)
+            else if TokenType = "c-tag" then Parse_NodeTag(state)
 
             else if TokenType = "c-ns-anchor-property" then Parse_NodeAnchor(state)
 
@@ -614,10 +683,6 @@ shared Yaml.Parse = let
             else if TokenType = "string" and NextTokenType = "c-mapping-value" then Parse_BlockMapping(state)
             
             else if TokenType = "string" then [State = NextState, Node = state[Token][Value]]
-            
-            else if TokenType = "c-literal" then Parse_LiteralBlockScalar(state)
-            
-            else if TokenType = "c-folded" then Parse_FoldedBlockScalar(state)
             
             else error Text.Format("Syntax error: unexpected token '#[TokenType]'", [TokenType = state[Token][Type]]),
 
